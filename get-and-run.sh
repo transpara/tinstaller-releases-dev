@@ -1,13 +1,12 @@
 #!/bin/bash
 # =============================================================================
-# get-and-run.sh (dev) — fetch and run a tinstaller binary from the private
+# get-and-run.sh (dev) — fetch and run a tinstaller binary from the public
 # transpara/tinstaller-releases-dev prerelease repo.
 #
-# DevReleases are GitHub *prereleases* in a *private* repo, so this launcher
-# uses the authenticated GitHub CLI (`gh`) rather than unauthenticated curl:
-#   - latest version resolves via `gh release list` (prerelease-aware), and
-#   - the binary downloads via `gh release download` (handles private auth).
-# Stable installs use the public launcher in transpara/tinstaller-releases.
+# DevReleases are GitHub *prereleases*, so version resolution uses the
+# /releases list (newest first, prerelease-aware) instead of /releases/latest
+# (which skips prereleases). Otherwise identical in spirit to the public
+# launcher in transpara/tinstaller-releases.
 #
 # Usage:
 #   get-and-run.sh <install-k3s|install-tsystem|install-control-plane> \
@@ -36,23 +35,27 @@ if [[ -z "$MODE" ]]; then
   exit 1
 fi
 
-if ! command -v gh &>/dev/null; then
-  echo "Error: 'gh' (GitHub CLI) is required to install private dev releases. https://cli.github.com/" >&2
-  exit 1
-fi
-if ! gh auth status &>/dev/null; then
-  echo "Error: 'gh' is not authenticated. Run: gh auth login" >&2
-  exit 1
-fi
-
-# Resolve version: explicit --version wins; otherwise the most recent release
-# (gh release list is prerelease-aware, newest first → highest -dev.N).
+# Resolve version: explicit --version wins; otherwise the newest release
+# (the /releases list is prerelease-aware and newest-first → highest -dev.N).
 if [[ -n "$VERSION" ]]; then
   echo "Using requested dev version: $VERSION"
 else
-  VERSION="$(gh release list --repo "$REPO" --limit 1 --json tagName --jq '.[0].tagName')"
-  if [[ -z "$VERSION" ]]; then
-    echo "Error: no dev releases found in $REPO." >&2
+  if ! command -v jq &>/dev/null; then
+    echo "Installing 'jq'..."
+    if [ -f /etc/debian_version ]; then
+      sudo apt-get update -y && sudo apt-get install -y jq
+    elif [ -f /etc/redhat-release ]; then
+      command -v dnf &>/dev/null && sudo dnf install -y jq || sudo yum install -y jq
+    elif grep -qi suse /etc/os-release 2>/dev/null; then
+      sudo zypper install -y jq
+    else
+      echo "Error: 'jq' is required. Install it manually or pass --version X.Y.Z-dev.N" >&2
+      exit 1
+    fi
+  fi
+  VERSION=$(curl -s "https://api.github.com/repos/${REPO}/releases" | jq -r '.[0].tag_name')
+  if [[ -z "$VERSION" || "$VERSION" == "null" ]]; then
+    echo "Error: failed to resolve the latest dev release from ${REPO}." >&2
     exit 1
   fi
   echo "Using latest dev release: $VERSION"
@@ -65,13 +68,19 @@ case "$ARCH" in
   *) echo "Error: unsupported architecture $ARCH" >&2; exit 1 ;;
 esac
 
-ASSET="${MODE}-linux-${ARCH}"
-echo "Downloading $ASSET from $REPO@$VERSION ..."
-rm -f "$MODE"
-gh release download "$VERSION" --repo "$REPO" --pattern "$ASSET" --output "$MODE" --clobber
-chmod +x "$MODE"
+BINARY_NAME="${MODE}-linux-${ARCH}"
+URL="https://github.com/${REPO}/releases/download/${VERSION}/${BINARY_NAME}"
 
-echo "--------------------------------------------------"
-echo "Executing: ./$MODE ${PASSTHROUGH_ARGS[*]}"
-echo "--------------------------------------------------"
-./"$MODE" "${PASSTHROUGH_ARGS[@]}"
+echo "Downloading $BINARY_NAME ..."
+rm -f "$BINARY_NAME" "$MODE"
+if curl -#LfO "$URL"; then
+  mv "$BINARY_NAME" "$MODE"
+  chmod +x "$MODE"
+  echo "--------------------------------------------------"
+  echo "Executing: ./$MODE ${PASSTHROUGH_ARGS[*]}"
+  echo "--------------------------------------------------"
+  ./"$MODE" "${PASSTHROUGH_ARGS[@]}"
+else
+  echo "Error: download failed: $URL" >&2
+  exit 1
+fi
